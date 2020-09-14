@@ -1,0 +1,203 @@
+- hosts: kafka
+  vars:
+      kafka_local_service_user: "kafka-local"
+      kafka_version: "2.13-2.5.0"
+      kafka_install_path: "/etc/kafka/kafka_{{ kafka_version }}"
+
+
+  tasks:
+
+## Create Local Account to Run Kafka Service
+    - name: Add the local user for Kafka Service
+      user:
+        name: "{{ kafka_local_service_user }}"
+        group: wheel
+
+## Package Management inc. Java
+
+    - name: Install Java 1.8.0
+      become: yes
+      yum:
+        name: 'java-1.8.0-openjdk'  
+        state: present
+
+    - name: Install Tar
+      become: yes
+      yum:
+        name: 'tar'  
+        state: present
+
+    - name: upgrade all packages
+      become: yes
+      yum:
+        name: '*'
+        state: latest
+
+    - name: Finding Java Version
+      find:
+        paths: /usr/lib/jvm
+        use_regex: yes
+        file_type: directory
+        patterns: "java*."
+      register: java_result
+
+    - name: Set environment variable - Create File 
+      become: yes
+      file: 
+        state: touch 
+        path: /etc/profile.d/kafka.sh
+
+    - name: Set environment variable - Add JAVA_HOME
+      become: yes
+      lineinfile:
+        path: /etc/profile.d/kafka.sh
+        line: "{{ 'JAVA_HOME=' + item.path }}"
+      with_items: "{{ java_result.files }}"
+
+## Kafka Install
+
+    - name: Create Kafka Directory
+      become: yes
+      file:
+        path: /etc/kafka
+        state: directory
+        mode: '0777'
+        recurse: yes
+
+##assumes agent will have access to installer installer locally. If not replace with wget or accessible path. 
+    - name: Extract Kafka into /etc/kafka
+      become: yes
+      unarchive:
+        src: /etc/ansible/installmedia/kakfa{{ kafka_version }}/kakfa_{{ kafka_version }}.tgz
+        dest: /etc/kafka
+
+    - name: Kafka.Service - Create File
+      become: yes
+      file: 
+        state: touch 
+        path: /etc/systemd/system/kafka.service
+
+    - name: Kafka.log - Create File
+      become: yes
+      file: 
+        state: touch 
+        path: "{{ kafka_install_path }}/kafka.log"     
+
+    - name: Kafka.Service - Populate File
+      become: yes
+      lineinfile: 
+        create: yes 
+        path: /etc/systemd/system/kafka.service
+        line: "{{ item }}"
+      with_items:
+        - "[Unit]"
+        - "Requires=zookeeper.service"
+        - "After=zookeeper.service"
+        - ""
+        - "[Service]"
+        - "Type=simple"
+        - "User={{ kafka_local_service_user }}"
+        - "ExecStart=/bin/sh -c '{{ kafka_install_path }}/bin/kafka-server-start.sh {{ kafka_install_path }}/config/server.properties > {{ kafka_install_path }}/kafka.log 2>&1'"
+        - "ExecStop={{ kafka_install_path }}/kafka-server-stop.sh"
+        - "Restart=on-abnormal"
+        - ""
+        - "[Install]"
+        - "WantedBy=multi-user.target"
+
+## Zookeeper
+
+    - name: Zookeeper.Service - Create File
+      become: yes
+      file: 
+        state: touch 
+        path: /etc/systemd/system/zookeeper.service
+
+    - name: Zookeeper.Service - Populate File
+      become: yes
+      lineinfile: 
+        create: yes 
+        path: /etc/systemd/system/zookeeper.service
+        line: "{{ item }}"
+      with_items:
+        - "[Unit]"
+        - "Description=Apache Zookeeper server"
+        - "Documentation=http://zookeeper.apache.org"
+        - "Requires=network.target remote-fs.target"
+        - "After=network.target remote-fs.target"
+        - "" 
+        - "[Service]"
+        - "Type=simple"
+        - "User={{ kafka_local_service_user }}"
+        - "ExecStart={{ kafka_install_path }}/bin/zookeeper-server-start.sh {{ kafka_install_path }}/config/zookeeper.properties"
+        - "ExecStop={{ kafka_install_path }}/bin/zookeeper-server-stop.sh"
+        - "Restart=on-abnormal"
+        - ""
+        - "[Install]"
+        - "WantedBy=multi-user.target"
+
+## Local User Permissions
+
+    - name: Set Local Permissions for Kafka Files
+      become: yes
+      file:
+        path: "{{ item }}"
+        mode: '0777'
+      with_items:
+        - "/etc/systemd/system/zookeeper.service"
+        - "/etc/systemd/system/kafka.service"
+        - "/etc/profile.d/kafka.sh"
+        - "/etc/kafka"
+
+## Set Services to Start
+
+    - name: Set Kafka service to start on boot
+      become: yes
+      command: systemctl enable kafka
+
+    - name: Set Zookeeper service to start on boot
+      become: yes
+      command: systemctl enable zookeeper
+
+## Create & Format Data Disk
+
+    - name: Partiion Second Disk
+      parted:
+        device: /dev/sdb
+        number: 1
+        state: present
+
+    - name: Create a ext4 filesystem on /dev/sdb1 and check disk blocks
+      filesystem:
+        fstype: ext4
+        dev: /dev/sdb1
+        opts: -L data_disk
+
+    - name: Mount up device by label
+      mount:
+        path: /mount/data_disk
+        src: LABEL=data_disk
+        fstype: ext4
+        state: mounted
+
+## Logging config
+
+    - name: Set Logging Limits
+      become: yes
+      lineinfile:
+        path: "{{kafka_install_path}}/config/server.properties"
+        regexp: "{{ item.setting }}"
+        line: "{{ item.setting + '=' + item.value }}"
+      loop:
+        ## Store Logs for 30 Days
+        - { setting: "log.retention.hours", value: "720" }
+        ## With a total size limit of 5GB
+        - { setting: "#log.retention.bytes", value: "5368706371" }
+
+## Reboot
+
+    - name: Reboot the machine
+      become: yes
+      reboot:
+
+
+
