@@ -1,0 +1,447 @@
+- hosts: nifi
+  vars:
+      nifi_dir_path: "/etc/nifi"
+      nifi_version: "1.11.4"
+      nifi_procesor_version: "1.8.0.3"
+      nifi_install_path: "{{ nifi_dir_path }}/nifi-{{ nifi_version }}"
+      nifi_key: "{{Some known Key}}"
+      nifi_local_service_user: "nifi-local"
+      java_keystore_name: nifi-keystore.jks
+      java_truststore_name: nifi-truststore.jks
+      keystore_config_location: /etc/security
+      data_disk_path: "/mount/data_disk"
+
+  tasks:
+## Create Local Account to Run Nifi Service
+    - name: Add the local user for Nifi Service
+      user:
+        name: "{{ nifi_local_service_user }}"
+        group: wheel
+
+## Set Wheel accounts to login no password
+    - name: Set wheel group users to not login with password
+      become: yes
+      lineinfile:
+        path: /etc/sudoers
+        create: yes
+        regexp: "# %wheel        ALL=(ALL)       NOPASSWD: ALL"
+        line: "%wheel        ALL=(ALL)       NOPASSWD: ALL"
+
+## Package Management inc. Java
+    - name: Install Java 1.8.0
+      become: yes
+      yum:
+        name: 'java-1.8.0-openjdk'  
+        state: present
+
+    - name: Install Python
+      become: yes
+      yum:
+        name: 'python3'
+        state: present
+
+    - name: Install Tar
+      become: yes
+      yum:
+        name: 'tar'  
+        state: present
+
+    - name: Install Share Pre-requisites
+      become: yes
+      yum:
+        name: ['samba-client', 'samba-common', 'cifs-utils']
+        state: present    
+        
+    - name: upgrade all packages
+      become: yes
+      yum:
+        name: '*'
+        state: latest
+
+    - name: Finding Java Version
+      find:
+        paths: /usr/lib/jvm
+        use_regex: yes
+        file_type: directory
+        patterns: "java*."
+      register: java_result
+
+    - name: Set environment variable - Create File 
+      become: yes
+      file: 
+        state: touch 
+        path: /etc/profile.d/nifi.sh
+
+    - name: Set environment variable - Add JAVA_HOME
+      become: yes
+      lineinfile:
+        path: /etc/profile.d/nifi.sh
+        line: "{{ 'JAVA_HOME=' + item.path }}"
+      with_items: "{{ java_result.files }}"
+
+## Nifi Config
+    - name: Set security.conf limits
+      become: yes
+      lineinfile:
+        path: /etc/security/limits.conf
+        create: yes
+        line: "{{ item }}"
+      with_items:
+        - "nifi hard nofile 50000" 
+        - "nifi soft nofile 50000"
+        - "nifi hard nproc 10000"
+        - "nifi soft nproc 10000"
+
+    - name: Create Nifi Directory
+      become: yes
+      file:
+        path: "{{ nifi_dir_path }}"
+        state: directory
+        owner: "{{ nifi_local_service_user }}"
+        mode: '0777'
+        recurse: yes
+
+##Assumed that the agent will have access to this install media locally. if not can be replaced with a wget
+    - name: Extract nifi into /etc/nifi
+      become: yes
+      unarchive:
+        src: /etc/ansible/installmedia/nifi{{nifi_version}}/nifi-{{nifi_version}}-bin.tar.gz
+        dest: "{{ nifi_dir_path }}"
+        keep_newer: yes
+
+    - name: Set bootstrap to run nifi as service user
+      become: yes
+      lineinfile:
+        path: "{{ nifi_install_path}}/conf/bootstrap.conf"
+        regexp: '^run.as='
+        line: "run.as={{nifi_local_service_user}}"
+
+    - name: Give local user access to install service
+      become: yes
+      file:
+        path: "/etc/rc.d"
+        state: directory
+        owner: "{{ nifi_local_service_user }}"
+        mode: '0777'
+        recurse: yes
+
+    - name: Give local user access to nifi dir
+      become: yes
+      file:
+        path: "{{ nifi_install_path }}"
+        state: directory
+        owner: "{{ nifi_local_service_user }}"
+        mode: '0777'
+        recurse: yes
+
+##Assumed that the agent will have access to this install media locally. if not can be replaced with a wget
+
+    - name: Install Nifi as a Service
+      become: yes
+      become_user: "{{ nifi_local_service_user }}"
+      command: "sh {{ nifi_install_path }}/bin/nifi.sh install nifi"
+
+    - name: Copy Nifi MarkLogic Processor
+      become: yes
+      copy:
+        src: "/etc/ansible/installmedia/marklogic_connectors/nifi_processor_{{ nifi_procesor_version }}/"
+        dest: "{{ nifi_install_path }}/lib"
+
+    - name: Remove Existing Props Key
+      become: yes
+      lineinfile:
+        path: "{{nifi_install_path}}/conf/nifi.properties"
+        regexp: "^nifi.sensitive.props.key="
+        state: absent
+
+    - name: Set Props Key to random string
+      become: yes
+      lineinfile:
+        path: "{{ nifi_install_path }}/conf/nifi.properties"
+        line: "{{ item.setting + '=-' + item.value }}"
+      loop:
+        - { setting: "### Ansible Props Key ###", value: "" }
+        - { setting: "nifi.sensitive.props.key", value: "{{ nifi_key }}" }
+
+    - name: Set reference to variable file
+      become: yes
+      lineinfile:
+        path: "{{ nifi_install_path }}/conf/nifi.properties"
+        line: "nifi.variable.registry.properties=./conf/variables.config" 
+
+    - name: Set Nifi service to start on boot
+      become: yes
+      command: systemctl enable nifi
+
+## Create service to run Nifi 
+    - name: NifiRunner.Service - Populate File
+      become: yes
+      lineinfile: 
+        create: yes 
+        path: /etc/systemd/system/nifiRunner.service
+        line: "{{ item }}"
+      with_items:
+        - "[Unit]"
+        - "Description=Apache NiFi"
+        - "After=network.target"
+        - "" 
+        - "[Service]"
+        - "Type=forking"
+        - "User={{ nifi_local_service_user }}"
+        - "ExecStart={{ nifi_install_path }}/bin/nifi.sh start"
+        - "ExecStop={{ nifi_install_path }}/bin/nifi.sh stop"
+        - "ExecRestart={{ nifi_install_path }}/bin/nifi.sh restart"
+        - ""
+        - "[Install]"
+        - "WantedBy=multi-user.target"
+
+## Set Permissions to Nifi Runner Service
+    - name: Set Local Permissions for Kafka Files
+      become: yes
+      file:
+        path: "{{ item }}"
+        mode: '0777'
+      with_items:
+        - "/etc/systemd/system/nifiRunner.service"
+
+## Set Services to Start
+
+    - name: Set Kafka service to start on boot
+      become: yes
+      command: systemctl enable nifiRunner
+
+## Shared Drive Config / Mounting
+    - name: Create secret file with local user as owner
+      become: yes
+      file: 
+        state: touch 
+        path: "{{ nifi_install_path }}/share_secret"
+        owner: "{{ nifi_local_service_user }}"
+        mode: '0400'
+
+    - name: Create mount directory
+      become: yes
+      file: 
+        state: directory 
+        path: /mount/win_share    
+
+    - name: Populate Secret File
+      become: yes
+      lineinfile:
+        path: "{{ nifi_install_path }}/share_secret"
+        line: "{{ item }}"
+      loop:
+        - "username={{ share_user }}"
+        - "password={{ share_pass }}"
+
+    - name: Populate fstab with share details
+      become: yes
+      lineinfile:
+        path: "/etc/fstab"
+        line: "{{ share_path }} /mount/win_share cifs user,uid=1000,rw,nocase,suid,credentials={{ nifi_install_path }}/share_secret 0 0"
+
+## Set Java limits
+    - name: Set Java Limits 
+      become: yes
+      lineinfile:
+        path: "{{ nifi_install_path }}/conf/bootstrap.conf"
+        regexp: "{{ item.setting }}"
+        line: "{{ item.setting + '=-' + item.value }}"
+      loop:
+        - { setting: "java.arg.2", value: "Xms1024m" }
+        - { setting: "java.arg.3", value: "Xmx1024m" }
+
+## Turn Swap Off -- Nifi recommend no swappiness 
+    - name: Set sysctl.conf limits
+      become: yes
+      lineinfile:
+        path: /etc/sysctl.conf
+        create: yes
+        line: "vm.swappiness = 0"
+
+## Grant Service User access to nifi directory
+    - name: Grant service user access to nifi directory
+      become: yes
+      acl:
+        path: "{{ nifi_install_path }}"
+        recursive: yes
+        permissions: rwx 
+        etype: user
+        entity: "{{ nifi_local_service_user }}"
+        state: present
+
+## Create & Format Data Disk
+    - name: Partiion Second Disk
+      parted:
+        device: /dev/sdb
+        number: 1
+        state: present
+
+    - name: Create a ext4 filesystem on /dev/sdb1 and check disk blocks
+      filesystem:
+        fstype: ext4
+        dev: /dev/sdb1
+        opts: -L data_disk
+
+    - name: Mount up device by label
+      mount:
+        path: "{{data_disk_path}}"
+        src: LABEL=data_disk
+        fstype: ext4
+        state: mounted
+
+## Edit Logging Config
+    - name: Install Python Pre-req (lxml)
+      pip:
+        name: lxml
+
+    - name: Set the Max Individual App_File Log Size to 100MB
+      xml:
+        path: "{{nifi_install_path}}/conf/logback.xml"
+        xpath: //appender[@name='APP_FILE']/rollingPolicy/maxFileSize
+        value: 100MB
+    
+    - name: Set the Max Total App_File Log Size to 10GB
+      xml:
+        path: "{{nifi_install_path}}/conf/logback.xml"
+        xpath: //appender[@name='APP_FILE']/rollingPolicy/totalSizeCap
+        value: 10GB
+
+    #Retention value is calculated per log
+    #Rention value/rollover is hourly - so 2160 = (90 days * 24 hours) for an hourly rolling log
+    - name: Set the Max App_File Log Retention Period 90 Days 
+      xml:
+        path: "{{nifi_install_path}}/conf/logback.xml"
+        xpath: //appender[@name='APP_FILE']/rollingPolicy/maxHistory
+        value: "2160"
+
+    #Retention value/rollover is daily
+    - name: Set the Max USER_FILE Log Retention Period to 90 Days
+      xml:
+        path: "{{nifi_install_path}}/conf/logback.xml"
+        xpath: //appender[@name='USER_FILE']/rollingPolicy/maxHistory
+        value: "90"
+
+    #Retention value/rollover is daily
+    - name: Set the Max BOOTSTRAP_FILE Log Retention Period to 90 Days
+      xml:
+        path: "{{nifi_install_path}}/conf/logback.xml"
+        xpath: //appender[@name='BOOTSTRAP_FILE']/rollingPolicy/maxHistory
+        value: "90"
+
+## Move Provenance Repository 
+    - name: Create mount directory
+      become: yes
+      file: 
+        state: directory 
+        path: "{{data_disk_path}}/provenance_repository"
+        owner: "{{ nifi_local_service_user }}"
+
+    - name: Remove Existing Provenance Settings
+      become: yes
+      lineinfile:
+        path: "{{nifi_install_path}}/conf/nifi.properties"
+        regexp: "{{ item.setting }}"
+        state: absent
+      loop:
+        - { setting: "nifi.provenance.repository.directory.default", value: "{{data_disk_path}}/provenance_repository" }
+        - { setting: "nifi.provenance.repository.max.storage.time", value: "72 Hours" }
+        - { setting: "nifi.provenance.repository.max.storage.size", value: "10 GB" }
+
+
+    - name: Set Provenance Settings
+      become: yes
+      lineinfile:
+        path: "{{nifi_install_path}}/conf/nifi.properties"
+        line: "{{ item.setting + '=' + item.value }}"
+      loop:
+        - { setting: "### Ansible provencence settings", value: "###" }
+        - { setting: "nifi.provenance.repository.directory.default", value: "{{data_disk_path}}/provenance_repository" }
+        - { setting: "nifi.provenance.repository.max.storage.time", value: "72 Hours" }
+        - { setting: "nifi.provenance.repository.max.storage.size", value: "10 GB" }
+
+## Copy and configure Java Key Stores to enable SSH
+
+    - name: Copy TrustStores
+      become: yes
+      copy:
+        src: "/etc/ansible/installmedia/nifi{{nifi_version}}/{{item}}"
+        dest: "{{ keystore_config_location }}"
+      loop:
+        - "{{ java_keystore_name }}"  
+        - "{{ java_truststore_name }}"
+
+    - name: Remove Existing Trust Store Config
+      become: yes
+      lineinfile:
+        path: "{{nifi_install_path}}/conf/nifi.properties"
+        regexp: "{{ item.setting }}"
+        state: absent
+      loop:
+        - { setting: "nifi.web.https.port", value: "8080" }
+        - { setting: "nifi.web.http.port", value: "" }
+        - { setting: "nifi.web.https.host", value: "{{ ansible_hostname }}.local" }          
+        - { setting: "nifi.security.keystore", value: "{{ keystore_config_location }}/{{ java_keystore_name }}" } 
+        - { setting: "nifi.security.keystoreType", value: "jks" } 
+        - { setting: "nifi.security.keystorePasswd", value: "{{ keystore_password }}" } 
+        - { setting: "nifi.security.keyPasswd", value: "{{ keystore_password}}" } 
+        - { setting: "nifi.security.truststore", value: "{{ keystore_config_location }}/{{ java_truststore_name }}" } 
+        - { setting: "nifi.security.truststoreType", value: "jks" } 
+        - { setting: "nifi.security.truststorePasswd", value: "{{ keystore_password }}" } 
+        - { setting: "nifi.remote.input.secure", value: "true" } 
+        - { setting: "nifi.security.user.login.identity.provider", value: "ldap-provider" }
+
+    - name: Set Trust Store Config
+      become: yes
+      lineinfile:
+        path: "{{nifi_install_path}}/conf/nifi.properties"
+        line: "{{ item.setting + '=' + item.value }}"
+      loop:
+        - { setting: "### Ansible Trust Store Config", value: "###" }
+        - { setting: "nifi.web.https.port", value: "8080" }
+        - { setting: "nifi.web.http.port", value: "" }
+        - { setting: "nifi.web.https.host", value: "{{ ansible_hostname }}.local" }          
+        - { setting: "nifi.security.keystore", value: "{{ keystore_config_location }}/{{ java_keystore_name }}" } 
+        - { setting: "nifi.security.keystoreType", value: "jks" } 
+        - { setting: "nifi.security.keystorePasswd", value: "{{ keystore_password }}" } 
+        - { setting: "nifi.security.keyPasswd", value: "{{ keystore_password}}" } 
+        - { setting: "nifi.security.truststore", value: "{{ keystore_config_location }}/{{ java_truststore_name }}" } 
+        - { setting: "nifi.security.truststoreType", value: "jks" } 
+        - { setting: "nifi.security.truststorePasswd", value: "{{ keystore_password }}" } 
+        - { setting: "nifi.remote.input.secure", value: "true" } 
+        - { setting: "nifi.security.user.login.identity.provider", value: "ldap-provider" }
+
+## Enabled LDAPS
+
+    - name: remove default XML configuration
+      file:
+        path: "{{ nifi_install_path }}/conf/{{item}}"
+        state: absent
+      loop:
+        - "login-identity-providers.xml"
+        - "authorizers.xml"
+
+    - name: Copy simplified XML LDAP config files to /conf
+      copy:
+        src: /etc/ansible/installmedia/nifi{{nifi_version}}/xml/{{ item }}
+        dest: "{{ nifi_install_path }}/conf/"
+      loop:
+        - "login-identity-providers.xml"
+        - "authorizers.xml"
+
+    - name: transform login-indentity-providers
+      xml: 
+            path: "{{ nifi_install_path }}/conf/login-identity-providers.xml"
+            xpath: "{{item.setting}}"
+            value: "{{item.value}}"
+      loop:
+        - { setting: "//property[@name ='Manager DN']", value: "{{ldap_account}}" }
+        - { setting: "//property[@name ='Manager Password']", value: "{{ldap_password}}" }
+        - { setting: "//property[@name ='TLS - Keystore Password']", value: "{{ldap_password}}" }
+        - { setting: "//property[@name ='TLS - Truststore Password']", value: "{{ldap_password}}" }
+            
+## Reboot 
+    - name: Reboot the machine
+      become: yes
+      reboot:
+        reboot_timeout: 1800
