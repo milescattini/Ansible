@@ -1,0 +1,26 @@
+- hosts: vault
+  vars:
+      ##Path can be whereever as long as the path is present in $PATH
+      vault_install_path: "/usr/local/bin/"
+      vault_download_url: "https://releases.hashicorp.com/vault/1.4.3/vault_1.4.3_linux_amd64.zip"
+  
+  tasks:
+##Download and unarchive Vault
+    - name: Download and unarchive vault 
+      become: yes
+      unarchive:
+        src: "{{ vault_download_url }}"
+        dest: "{{ vault_install_path }}"
+        remote_src: yes
+
+    - name: Enable LDAP
+      become: yes
+      command: vault auth enable ldap
+
+# Package Management
+    - name: upgrade all packages
+      become: yes
+      yum:
+        name: '*'
+        state: latest
+
