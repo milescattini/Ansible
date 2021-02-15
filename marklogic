@@ -1,0 +1,206 @@
+- hosts: marklogic
+  vars: 
+      huge_pagesize: "5120" 
+      marklogic_version: "10.0.4"
+      marklogic_local_service_user: "marklogic-local"
+      swap_file_location: "/mount/data_disk/swapfile"
+      install_media: "/opt/installmedia/marklogic{{ marklogic_version }}/marklogic-{{ marklogic_version }}.x86_64.rpm"
+     
+  tasks:
+## Create Local Account to Run MarkLogic Service
+    - name: Add the local user for MarkLogic Service
+      user:
+        name: "{{ marklogic_local_service_user }}"
+        group: wheel
+
+## Package Management inc. Java
+    - name: Install Java 11
+      become: yes
+      yum:
+        name: 'java-11-openjdk-devel'  
+        state: present
+
+    - name: Install sdkman pre-reqs
+      become: yes
+      yum:
+        name: ['unzip','zip','curl']  
+        state: present
+      register: sdkman
+
+    ## Reboot the machine to enable unzip install
+    - name: Reboot the machine
+      become: yes
+      reboot:
+        reboot_timeout: 1800
+      when: sdkman.changed
+     
+    - name: upgrade all packages
+      become: yes
+      yum:
+        name: '*'
+        state: latest
+
+    - name: Finding Java Version
+      find:
+        paths: /usr/lib/jvm
+        use_regex: yes
+        file_type: directory
+        patterns: "java*."
+      register: java_result
+
+    - name: Set environment variable - Create File 
+      become: yes
+      file: 
+        state: touch 
+        path: /etc/profile.d/marklogic.sh
+
+    - name: Set environment variable - Add JAVA_HOME
+      become: yes
+      lineinfile:
+        path: /etc/profile.d/marklogic.sh
+        line: "{{ 'JAVA_HOME=' + item.path }}"
+      with_items: "{{ java_result.files }}"
+
+    - name: upgrade all packages
+      become: yes
+      yum:
+        name: '*'
+        state: latest
+
+##Install Mark Logic
+    - name: Create MarkLogic Source Directory
+      file:
+        path: /tmp/ML
+        state: directory
+        mode: '0777'
+
+    - name: Copy MarkLogic rpm file to server
+      copy:
+        src: "{{ install_media }}"
+        dest: /tmp/ML/marklogic.rpm
+
+    - name: Copy MarkLogic Converters rpm file to server
+      copy:
+        src: "/etc/ansible/installmedia/marklogic{{ marklogic_version }}/marklogicconverters-{{ marklogic_version }}.x86_64.rpm"
+        dest: /tmp/ML/marklogicconverters.rpm
+
+    - name: Finding RPM files
+      find:
+        paths: "/tmp/ML"
+        patterns: "*.rpm"
+      register: rpm_result
+
+    - name: Install RPM
+      become: yes
+      yum:
+        name: "{{ item.path }}"
+        state: present
+      with_items: "{{ rpm_result.files }}"
+
+    - name: remove ML Directory
+      file:
+        name: "/tmp/ML"
+        state: absent
+
+
+## MarkLogic Config
+    - name: Create MarkLogic.conf
+      become: yes
+      file:
+        path: /etc/marklogic.conf
+        state: touch
+        owner: "{{ marklogic_local_service_user }}"
+
+    - name: Set ML to run as service account
+      become: yes
+      lineinfile:
+        path: /etc/marklogic.conf
+        line: "export MARKLOGIC_USER={{ marklogic_local_service_user }}"
+
+    - name: set ownership for service account
+      become: yes
+      file:
+        owner: "{{ marklogic_local_service_user }}"
+        path: '/var/opt/MarkLogic' 
+
+    - name: Create MarkLogic Var/Opt
+      become: yes
+      file:
+        path: '/var/opt/MarkLogic' 
+        state: directory
+        owner: "{{ marklogic_local_service_user }}"
+   
+    - name: disable THP 
+      become: yes
+      command: "echo never > /sys/kernel/mm/transparent_hugepage/enabled"
+
+## Create & Format Data Disk
+
+    - name: Partiion Second Disk
+      parted:
+        device: /dev/sdb
+        number: 1
+        state: present
+
+    - name: Create a ext4 filesystem on /dev/sdb1 and check disk blocks
+      filesystem:
+        fstype: ext4
+        dev: /dev/sdb1
+        opts: -L data_disk
+
+    - name: Mount up device by label
+      mount:
+        path: /mount/data_disk
+        src: LABEL=data_disk
+        fstype: ext4
+        state: mounted
+    
+    - name: Create MarkLogic Source Directory
+      file:
+        path: /mount/data_disk
+        state: directory
+        owner: "{{ marklogic_local_service_user }}"
+
+    - name: Create MarkLogic DataDisk Directory
+      file:
+        path: /mount/data_disk/MarkLogic
+        state: directory
+        owner: "{{ marklogic_local_service_user }}"
+
+    - name: Set MarkLogic DataDisk in conf
+      become: yes
+      lineinfile:
+        path: /etc/marklogic.conf
+        line: "export MARKLOGIC_DATA_DIR=/mount/data_disk/MarkLogic"
+
+## Pagefile Size
+
+    - name: Create swap file
+      become: yes
+      file:
+        path: "{{ swap_file_location }}"
+        state: touch
+
+    - name: create pagefile with fallocate
+      command: "fallocate -l {{ ansible_memory_mb.real.total }}M {{ swap_file_location }}"
+
+    - name: set swap file permisisons
+      become: yes
+      file:
+        mode: '0777'
+        path: '{{ swap_file_location }}' 
+
+    - name: enable swap file
+      become: yes
+      command: "mkswap {{ swap_file_location }}"
+
+    - name: set swap file permisisons
+      become: yes    
+      command: "swapon {{ swap_file_location }}"
+
+## Reboot 
+
+    - name: Reboot the machine
+      become: yes
+      reboot:
+        reboot_timeout: 1800
